@@ -1,0 +1,340 @@
+using JuMP
+using PowerModels
+using Gurobi
+using DataFrames
+using Plots
+using Plots.PlotMeasures
+using SparseArrays
+using CSV
+using StatsBase
+
+## reading data using PowerModels 
+NetworkData = PowerModels.parse_file("Systeminfo.m") # read raw data
+ref = PowerModels.build_ref(NetworkData)[:it][:pm][:nw][0]  # extract useful data
+baseMVA = NetworkData["baseMVA"]
+
+## Define generator type 
+Ncoal = 6;
+Ncc = 3;
+Nct = 6;
+Noil = 1;
+NRE = 1;
+RegRE = 0.06; #regulation capacity of renewable
+gentype = vcat(repeat(["Coal"],Ncoal),repeat(["CC"],Ncc),repeat(["CT"],Nct),repeat(["Oil"],Noil),repeat(["RE"],NRE))
+#create "gentype" in ref
+for i in 1:length(ref[:gen])
+    ref[:gen][i]["type"] = gentype[i]
+end
+#assign parameters to each type of generators
+for i in 1:length(ref[:gen])
+    if ref[:gen][i]["type"] == "CC"
+        ref[:gen][i]["fprice"] = 4 # fuel price, $/mmbtu
+        ref[:gen][i]["Rcost"] = 6 #reserve cost, $/MW
+        ref[:gen][i]["Rmax"] = 0.05* ref[:gen][i]["pmax"] #reserve capacity, MW
+        ref[:gen][i]["VOM"] = 2 # variable O&M cost, $/MWh
+        ref[:gen][i]["ER"] = 0.053  #emission, metric tons/mmbtu
+    elseif ref[:gen][i]["type"] == "CT"
+        ref[:gen][i]["fprice"] = 4
+        ref[:gen][i]["Rcost"] = 4
+        ref[:gen][i]["Rmax"] = 0.08 * ref[:gen][i]["pmax"]
+        ref[:gen][i]["VOM"] = 1
+        ref[:gen][i]["ER"] = 0.053 
+    elseif ref[:gen][i]["type"] == "Coal"
+        ref[:gen][i]["fprice"] = 3
+        ref[:gen][i]["Rcost"] = 10
+        ref[:gen][i]["Rmax"] = 0.02 * ref[:gen][i]["pmax"]
+        ref[:gen][i]["VOM"] = 4
+        ref[:gen][i]["ER"] = 0.095
+    elseif ref[:gen][i]["type"] == "RE"
+        ref[:gen][i]["fprice"] = 0
+        ref[:gen][i]["Rcost"] = 1
+        ref[:gen][i]["Rmax"] = RegRE * ref[:gen][i]["pmax"]
+        ref[:gen][i]["VOM"] = 0
+        ref[:gen][i]["ER"] = 0 
+    elseif ref[:gen][i]["type"] == "Oil"
+        ref[:gen][i]["fprice"] = 7
+        ref[:gen][i]["Rcost"] = 4
+        ref[:gen][i]["Rmax"] = 0.08 * ref[:gen][i]["pmax"]
+        ref[:gen][i]["VOM"] = 1
+        ref[:gen][i]["ER"] = 0.073 
+    end
+end
+
+FOM = [250000.0,275000.0,350000.0,350000.0,480000.0,630000.0,36000.0,50000.0,112500.0,28000.0,28000.0,28000.0,32000.0,32000.0,40000.0, 0, 0]
+
+## add storage into ref structure
+ref[:bus_ES] = Dict{Int64, Any}()
+for i = keys(ref[:bus])
+    ref[:bus_ES][i] = []
+end
+ref[:bus_ES][7] = 1
+ref[:load_ES] = Dict{Int64, Any}()
+ref[:load_ES][1] = 1
+Rmax_ES = 0 #maximum reserve capacity of es
+Rcost_ES = 1 #reserve cost of es
+ESrate = 0.05 #es increasing rate
+
+## carbon tax (adjust carbon tax here)
+Ctax = 100  
+
+## forced coal retirement (adjust forced coal retirement here)
+forceunit = 0
+forceyear = 0
+
+## load design
+loadcurve = [166.0 167.0 167.0; 250.0 250.0 250.0; 200.0 200.0 200.0; 234.0 233.0 233.0]
+
+## system reserve requirement (will be changed later when solve)
+Rreq = 20/baseMVA
+
+## build the optimization model using JuMP (MIQP)
+PSdecarbonization = Model(Gurobi.Optimizer)
+#variable
+@variable(PSdecarbonization, Pg[i in keys(ref[:gen])] >= 0) #generation
+@variable(PSdecarbonization, Rg[i in keys(ref[:gen])] >= 0) #reserve
+@variable(PSdecarbonization, Rg_ES >= 0) #reserve from es
+@variable(PSdecarbonization, UC[i in keys(ref[:gen])], Bin) #unit commitment
+@variable(PSdecarbonization, ref[:bus][i]["vmin"] <= Vm[i in keys(ref[:bus])] <= ref[:bus][i]["vmax"]) #bus voltage magnitude
+@variable(PSdecarbonization, Va[i in keys(ref[:bus])]) #bus voltage angle
+@variable(PSdecarbonization, -ref[:branch][l]["rate_a"] <= Pf[(l,i,j) in ref[:arcs]] <= ref[:branch][l]["rate_a"]) #real power flow
+#generator limit
+@constraint(PSdecarbonization, pgupper[i in keys(ref[:gen])], Pg[i] + Rg[i] <= UC[i] * ref[:gen][i]["pmax"])
+@constraint(PSdecarbonization, pglower[i in keys(ref[:gen])], Pg[i] - Rg[i] >= UC[i] * ref[:gen][i]["pmin"])
+@constraint(PSdecarbonization, rgupper[i in keys(ref[:gen])], Rg[i] <= ref[:gen][i]["Rmax"])
+@constraint(PSdecarbonization, rgupper_ES, Rg_ES <= Rmax_ES)
+#system reserve requirement
+@constraint(PSdecarbonization, rglower, Rg_ES + sum(Rg[i] for i in keys(ref[:gen])) >= Rreq)
+#set Va at reference bus is zero
+@constraint(PSdecarbonization, refva[i in keys(ref[:ref_buses])], Va[i] == 0)
+#power balance at each node
+@constraint(PSdecarbonization, pgnodal[i in keys(ref[:bus])],sum(Pg[a] for a in ref[:bus_gens][i]) -sum(ref[:load][d]["pd"] for d in ref[:bus_loads][i]) -sum(0.038*Rg_ES*ref[:load_ES][d] for d in ref[:bus_ES][i]) ==sum(Pf[f] for f in ref[:bus_arcs][i]))
+#power flow equations
+for i = keys(ref[:branch])
+    ref[:branch][i]["g"] = real(1/(ref[:branch][i]["br_r"] + ref[:branch][i]["br_x"] * im))
+    ref[:branch][i]["b"] = imag(1/(ref[:branch][i]["br_r"] + ref[:branch][i]["br_x"] * im))
+end
+@constraint(PSdecarbonization, pflow[l in (ref[:arcs])], Pf[l] ==ref[:branch][l[1]]["b"]*(Va[l[2]]-Va[l[3]]))
+@constraint(PSdecarbonization, angmax[l in ref[:arcs_from]], Va[l[2]] - Va[l[3]] <= ref[:branch][l[1]]["angmax"])
+@constraint(PSdecarbonization, angmin[l in ref[:arcs_from]], Va[l[2]] - Va[l[3]] >= ref[:branch][l[1]]["angmin"])
+#objective
+@objective(PSdecarbonization, Min, Rg_ES*Rcost_ES*100 + sum((gen["fprice"] + gen["ER"]*Ctax)*(gen["cost"][1]*(Pg[i])^2 +gen["cost"][2]*Pg[i] + UC[i]*gen["cost"][3]) + gen["VOM"]*Pg[i]*100 + Rg[i]*100*gen["Rcost"] for (i,gen) in ref[:gen]))
+
+## fixed model (QP): the fixed model is the same as the MIQP except that UC is continuous 
+Fixedmodel = Model(Gurobi.Optimizer)
+@variable(Fixedmodel, Pg_f[i in keys(ref[:gen])] >= 0)
+@variable(Fixedmodel, Rg_f[i in keys(ref[:gen])] >= 0) 
+@variable(Fixedmodel, Rg_ES_f >= 0) 
+@variable(Fixedmodel, 0 <= UC_f[i in keys(ref[:gen])] <= 1) 
+@variable(Fixedmodel, Va_f[i in keys(ref[:bus])]) 
+@variable(Fixedmodel, -ref[:branch][l]["rate_a"] <= Pf_f[(l,i,j) in ref[:arcs]] <= ref[:branch][l]["rate_a"]) 
+#constraints
+@constraint(Fixedmodel, pgupper_f[i in keys(ref[:gen])], Pg_f[i] + Rg_f[i] <= UC_f[i] * ref[:gen][i]["pmax"])
+@constraint(Fixedmodel, pglower_f[i in keys(ref[:gen])], Pg_f[i] - Rg_f[i] >= UC_f[i] * ref[:gen][i]["pmin"])
+@constraint(Fixedmodel, rgupper_f[i in keys(ref[:gen])], Rg_f[i] <= ref[:gen][i]["Rmax"])
+@constraint(Fixedmodel, rgupper_ES_f, Rg_ES_f <= Rmax_ES)
+@constraint(Fixedmodel, rglower_f, Rg_ES_f + sum(Rg_f[i] for i in keys(ref[:gen])) >= Rreq)
+@constraint(Fixedmodel, refva_f[i in keys(ref[:ref_buses])], Va_f[i] == 0)
+@constraint(Fixedmodel, pgnodal_f[i in keys(ref[:bus])],sum(Pg_f[a] for a in ref[:bus_gens][i]) -sum(ref[:load][d]["pd"] for d in ref[:bus_loads][i]) -sum(0.038*Rg_ES_f*ref[:load_ES][d] for d in ref[:bus_ES][i]) ==sum(Pf_f[f] for f in ref[:bus_arcs][i]))
+@constraint(Fixedmodel, pflow_f[l in (ref[:arcs])], Pf_f[l] == ref[:branch][l[1]]["b"]*(Va_f[l[2]]-Va_f[l[3]]))
+@constraint(Fixedmodel, angmax_f[l in ref[:arcs_from]], Va_f[l[2]] - Va_f[l[3]] <= ref[:branch][l[1]]["angmax"])
+@constraint(Fixedmodel, angmin_f[l in ref[:arcs_from]], Va_f[l[2]] - Va_f[l[3]] >= ref[:branch][l[1]]["angmin"])
+#objective
+@objective(Fixedmodel, Min, Rg_ES_f*Rcost_ES*baseMVA + sum((gen["fprice"] + gen["ER"]*Ctax)*(gen["cost"][1]*(Pg_f[i])^2 +gen["cost"][2]*Pg_f[i] + UC_f[i]*gen["cost"][3]) + gen["VOM"]*Pg_f[i]*baseMVA + Rg_f[i]*baseMVA*gen["Rcost"] for (i,gen) in ref[:gen]))
+@constraint(Fixedmodel, unitc_f[i in keys(ref[:gen])], UC_f[i] == 1) #fix all integer variable; right-hand side value would be changed later
+
+
+## Solve the problem
+year = 11
+season = 4
+Nbus = length(keys(ref[:bus]))
+Ngen = length(keys(ref[:gen]))
+Nline = length(keys(ref[:branch]))
+
+#results of variables
+result_obj = zeros(1, year*season)
+result_gen = zeros(Ngen, year*season)
+result_UC = zeros(Ngen, year*season)
+result_reserve = zeros(Ngen, year*season)
+result_bus = zeros(Nbus, year*season)
+result_line = zeros(Nline*2, year*season)
+result_ES = zeros(1, year*season)
+result_dual = zeros(Nbus, year*season)
+result_Rprice = zeros(1, year*season)
+#results of further calculation
+result_yearobj = zeros(year)
+result_gencost = zeros(Ngen, year*season)
+result_genCTcost = zeros(Ngen, year*season)
+result_reservecost = zeros(Ngen, year*season)
+result_genrevenue = zeros(Ngen, year*season)
+result_reserverevenue = zeros(Ngen, year*season)
+result_profit = zeros(Ngen, year*season)
+result_yearprofit = zeros(Ngen, year)
+result_netprofit = zeros(Ngen, year)
+result_yeargen = zeros(Ngen, year)
+result_yearreserve = zeros(Ngen, year)
+result_yearES = zeros(1, year)
+result_yearCTcost = zeros(Ngen, year)
+result_genemission = zeros(Ngen, year*season) #generator hourly emissions
+result_yeargen_emission = zeros(Ngen, year) #generator yearly emissions
+result_yeargen_emissiontype = zeros(4, year) #generator type yearly emissions
+result_Rreq = zeros(2,year*season)
+#results of fixed model
+result_obj_f = zeros(1, year*season)
+result_gen_fixed = zeros(Ngen, year*season)
+result_UC_fixed = zeros(Ngen, year*season)
+result_reserve_fixed = zeros(Ngen, year*season)
+result_bus_fixed = zeros(Nbus, year*season)
+result_line_fixed = zeros(Nline*2, year*season)
+result_ES_fixed = zeros(1, year*season)
+# track retirement
+RetireID = zeros(1,year)
+RetireIDforced = zeros(1,year)
+ExistID = collect(1:1:Ngen)
+ExistID_fossil = collect(1:1:Ncoal+Ncc+Nct+Noil)
+ESmax = zeros(1,year*season)
+NewRE = zeros(1,year)
+TotalRE = zeros(1,1)
+
+#solving
+for i = 1:year
+    for j = 1:season 
+        TotalRE = sum(NewRE) #calculate total RE capacity
+        Rreq = 0.03*sum(loadcurve[j,:])/baseMVA + 0.05*TotalRE #set reserve requirement as a function of load and Rreq
+        set_normalized_rhs(rglower, Rreq) #set reserve requirement 
+        set_normalized_rhs(rgupper_ES, Rreq*ESrate*(i-1)) #set storage capacity
+        set_normalized_rhs(pgnodal[5], loadcurve[j,1]/baseMVA) #set load in each season at each node
+        set_normalized_rhs(pgnodal[7], loadcurve[j,2]/baseMVA)
+        set_normalized_rhs(pgnodal[9], loadcurve[j,3]/baseMVA)
+        
+        #solve the MIQP
+        optimize!(PSdecarbonization) 
+        result_obj[(i-1)*4 + j*1] = JuMP.objective_value(PSdecarbonization) #record objective value
+        for s = 1:Ngen
+            result_gen[s,(i-1)*4 + j*1] = value.(Pg)[s]*baseMVA   
+            result_UC[s,(i-1)*4 + j*1] = value.(UC)[s]
+            result_reserve[s,(i-1)*4 + j*1] = value.(Rg)[s]*baseMVA
+        end
+        for s = 1:Nbus
+            result_bus[s,(i-1)*4 + j*1] = value.(Va)[s]
+        end
+        result_line[:,(i-1)*4 + j*1] = value.(Pf.data).*baseMVA
+        result_ES[1,(i-1)*4 + j*1] = value.(Rg_ES)*baseMVA
+
+        #solve the QP
+        for k = 1:Ngen
+            set_normalized_rhs(unitc_f[k], value.(UC)[k]) #fix unit commitment variable at their optimal value
+        end
+        set_normalized_rhs(rglower_f, Rreq) 
+        set_normalized_rhs(rgupper_ES_f, Rreq*ESrate*(i-1)) 
+        set_normalized_rhs(pgnodal_f[5], loadcurve[j,1]/baseMVA) 
+        set_normalized_rhs(pgnodal_f[7], loadcurve[j,2]/baseMVA)
+        set_normalized_rhs(pgnodal_f[9], loadcurve[j,3]/baseMVA)
+        optimize!(Fixedmodel)
+        result_obj_f[(i-1)*4 + j*1] = JuMP.objective_value(Fixedmodel)
+        for s = 1:Ngen
+            result_gen_fixed[s,(i-1)*4 + j*1] = value.(Pg_f)[s]*baseMVA; #record fixedmodel results to test whether different
+            result_UC_fixed[s,(i-1)*4 + j*1] = value.(UC_f)[s]
+            result_reserve_fixed[s,(i-1)*4 + j*1] = value.(Rg_f)[s]*baseMVA
+        end
+        result_line_fixed[:,(i-1)*4 + j*1] = value.(Pf_f.data).*baseMVA
+        result_ES_fixed[1,(i-1)*4 + j*1] = value.(Rg_ES_f)*baseMVA
+        for s = 1:Nbus
+            result_bus_fixed[s,(i-1)*4 + j*1] = value.(Va_f)[s]
+            result_dual[s,(i-1)*4 + j*1] = dual(pgnodal_f[s])./baseMVA
+        end
+        result_Rprice[1,(i-1)*4 + j*1] = dual(rglower_f)./baseMVA
+
+        #calculate profit and emission
+        for s = 1:Ngen
+            g = ref[:gen][s]["gen_bus"]
+            result_gencost[s,(i-1)*4 + j] = ref[:gen][s]["VOM"] * value.(Pg)[s]*100 + (ref[:gen][s]["fprice"]+ref[:gen][s]["ER"]*Ctax)*
+                (ref[:gen][s]["cost"][1]*(value.(Pg)[s])^2 + ref[:gen][s]["cost"][2] * value.(Pg)[s] + value.(UC)[s]*ref[:gen][s]["cost"][3])
+            result_genCTcost[s,(i-1)*4 + j] = ref[:gen][s]["ER"]*Ctax*(ref[:gen][s]["cost"][1]*(value.(Pg)[s])^2 + ref[:gen][s]["cost"][2] * value.(Pg)[s] + value.(UC)[s]*ref[:gen][s]["cost"][3])
+            result_reservecost[s,(i-1)*4 + j] = ref[:gen][s]["Rcost"] * value.(Rg)[s] *100
+            result_genrevenue[s,(i-1)*4 + j] = value.(Pg)[s] * dual(pgnodal_f[g])
+            result_reserverevenue[s,(i-1)*4 + j] = value.(Rg)[s] * dual(rglower_f)
+            result_profit[s,(i-1)*4 + j] = result_genrevenue[s,(i-1)*4 + j] + result_reserverevenue[s,(i-1)*4 + j] - result_gencost[s,(i-1)*4 + j*1] - result_reservecost[s,(i-1)*4 + j*1]
+            result_genemission[s,(i-1)*4 + j] = ref[:gen][s]["ER"] * (ref[:gen][s]["cost"][1]*(value.(Pg)[s])^2 + ref[:gen][s]["cost"][2] * value.(Pg)[s] + value.(UC)[s]*ref[:gen][s]["cost"][3])
+        end
+    end #for j
+
+    #calculate yearly ES regulation
+    result_yearES[1,i] = 2190*sum(result_ES[1,(i-1)*4+1:(i-1)*4+4])
+
+    #calculate yearly profit, net profit and yearly emission
+    for s = 1:Ngen
+        result_yeargen[s,i] = 2190*sum(result_gen[s,(i-1)*4+1:(i-1)*4+4]) 
+        result_yearreserve[s,i] = 2190*sum(result_reserve[s,(i-1)*4+1:(i-1)*4+4]) 
+        result_yearCTcost[s,i] = 2190*sum(result_genCTcost[s,(i-1)*4+1:(i-1)*4+4]) 
+        result_yearprofit[s,i] = 2190*sum(result_profit[s,(i-1)*4+1:(i-1)*4+4])
+        result_netprofit[s,i] = result_yearprofit[s,i] - FOM[s]
+
+        result_yeargen_emission[s,i] = 2190*sum(result_genemission[s,(i-1)*4+1:(i-1)*4+4]) 
+    end
+
+    result_yeargen_emissiontype[:,i] = [sum(result_yeargen_emission[1:Ncoal,i],dims = 1);sum(result_yeargen_emission[Ncoal+1:Ncoal+Ncc,i],dims = 1);sum(result_yeargen_emission[Ncoal+Ncc+1:Ncoal+Ncc+Nct,i],dims = 1);result_yeargen_emission[Ncoal+Ncc+Nct+Noil,i]]
+
+    #calculate yearly system cost (objective)
+    result_yearobj[i] = 2190*sum(result_obj[(i-1)*4+1:(i-1)*4+4])
+
+################################################################################Forced retirement
+    if forceunit != 0
+        if i == forceyear
+            fix(UC[forceunit], 0) #force the UC variable of the retired unit to be zero
+            filter!(x->x≠forceunit,ExistID) #filter out retired unit from exist ID list
+            filter!(x->x≠forceunit,ExistID_fossil) #filter out retired unit from exist ID list
+
+            ref[:gen][17]["pmax"] = sum(NewRE) + ref[:gen][forceunit]["pmax"]
+            set_normalized_coefficient(pgupper[17], UC[17], -ref[:gen][17]["pmax"])
+            set_normalized_coefficient(pgupper_f[17], UC_f[17], -ref[:gen][17]["pmax"])
+            ref[:gen][17]["Rmax"] = RegRE * ref[:gen][17]["pmax"]
+            set_normalized_coefficient(rgupper[17], UC[17], -ref[:gen][17]["Rmax"])
+            set_normalized_coefficient(rgupper_f[17], UC_f[17], -ref[:gen][17]["Rmax"])
+            NewRE[1,i] = NewRE[1,i] + ref[:gen][forceunit]["pmax"]
+        end
+    end
+################################################################################Forced retirement
+
+################################################################################Economic retirement
+    #find the smallest netprofit among existing units
+    global Idx = findall(x -> x == minimum([result_netprofit[s,i] for s in ExistID_fossil]), result_netprofit[1:16,i])
+    if length(Idx) > 1
+        global retireunit = Idx[Idx .∉ Ref(RetireID)][1]
+    else
+        global retireunit = Idx[1]
+    end #find out the only one minimum unit
+
+    if result_netprofit[retireunit,i] < 0.00
+        fix(UC[retireunit], 0) #retirement command
+        filter!(x->x≠retireunit,ExistID) #filter out retired unit from exist ID list
+        filter!(x->x≠retireunit,ExistID_fossil) #filter out retired unit from exist ID list
+        RetireID[i] = retireunit #record retirement unit ID
+
+        ref[:gen][17]["pmax"] = sum(NewRE)+ref[:gen][retireunit]["pmax"]
+        set_normalized_coefficient(pgupper[17], UC[17], -ref[:gen][17]["pmax"])
+        set_normalized_coefficient(pgupper_f[17], UC_f[17], -ref[:gen][17]["pmax"])
+        ref[:gen][17]["Rmax"] = RegRE * ref[:gen][17]["pmax"]
+        set_normalized_coefficient(rgupper[17], UC[17], -ref[:gen][17]["Rmax"])
+        set_normalized_coefficient(rgupper_f[17], UC_f[17], -ref[:gen][17]["Rmax"])
+        NewRE[1,i] = NewRE[1,i] + ref[:gen][retireunit]["pmax"]
+    end
+################################################################################Economic retirement
+end #for i
+
+## more results calculation
+result_yearemission = sum(result_yeargen_emission,dims = 1) #yearly emission
+result_emission = sum(result_yearemission, dims = 2)
+
+## plotting exanple
+#Emission plot
+plot_emission = plot(collect(0:1:year-1), result_yearemission',
+    xlabel = "Year", ylabel = "Emission (metric ton)",
+    legendfontsize = 6,
+    guidefontsize = 8,
+    tickfontsize = 6,
+    xticks = (collect(0:1:year),collect(0:1:year)),
+    margin = -1mm,
+    size = (600,400))
+
+display(plot_emission)
+
